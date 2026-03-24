@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+*.ovpn
+config.py
+login_error.png
+session.json
+browser-state/
+.claude/

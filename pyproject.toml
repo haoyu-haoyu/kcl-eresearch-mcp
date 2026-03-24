@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kcl-eresearch-mcp"
+version = "0.2.1"
+description = "Fully automated MCP server for KCL e-Research Portal — zero-intervention MFA, VPN, and SSH for CREATE HPC"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Haoyu Wang" },
+]
+keywords = ["mcp", "kcl", "hpc", "create", "mfa", "openvpn", "e-research"]
+
+[project.urls]
+Homepage = "https://github.com/haoyu-haoyu/kcl-eresearch-mcp"
+Repository = "https://github.com/haoyu-haoyu/kcl-eresearch-mcp"
+Issues = "https://github.com/haoyu-haoyu/kcl-eresearch-mcp/issues"
+dependencies = [
+    "mcp>=1.0.0",
+    "pydantic>=2.0",
+    "playwright>=1.40.0",
+    "httpx>=0.27.0",
+    "pyotp>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+kcl-er-mcp = "kcl_er_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kcl_er_mcp"]
