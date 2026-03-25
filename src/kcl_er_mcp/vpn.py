@@ -6,7 +6,6 @@ import asyncio
 import logging
 import os
 import re
-import signal
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,7 +15,6 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 STATE_DIR = Path.home() / ".kcl-er-mcp"
-VPN_PID_FILE = STATE_DIR / "openvpn.pid"
 VPN_LOG_FILE = STATE_DIR / "openvpn.log"
 DEFAULT_OVPN_DIR = STATE_DIR / "vpn-configs"
 
@@ -76,15 +74,24 @@ class VPNManager:
         if not openvpn:
             return VPNStatus(connected=False, error="openvpn not found. Install: brew install openvpn")
         try:
+            # Pre-create log file with user ownership so we can read it later
+            VPN_LOG_FILE.touch(exist_ok=True)
             proc = await asyncio.create_subprocess_exec(
                 "sudo", openvpn, "--config", str(cfg),
-                "--log", str(VPN_LOG_FILE), "--writepid", str(VPN_PID_FILE),
+                "--log-append", str(VPN_LOG_FILE),
                 "--daemon", "kcl-er-vpn",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             await proc.communicate()
-            for _ in range(30):
+            for i in range(60):
                 await asyncio.sleep(1)
+                # Fix log permissions once it exists
+                if i == 3 and VPN_LOG_FILE.exists():
+                    fix = await asyncio.create_subprocess_exec(
+                        "sudo", "chmod", "644", str(VPN_LOG_FILE),
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    )
+                    await fix.communicate()
                 s = await self.status()
                 if s.connected:
                     return s
@@ -93,46 +100,81 @@ class VPNManager:
             return VPNStatus(connected=False, error=str(e))
 
     async def disconnect(self) -> VPNStatus:
-        pid = self._read_pid()
+        pid = await self._find_pid()
         if pid:
             try:
-                os.kill(pid, signal.SIGTERM)
-                for _ in range(10):
-                    try:
-                        os.kill(pid, 0)
-                        await asyncio.sleep(0.5)
-                    except OSError:
-                        break
-            except OSError:
                 proc = await asyncio.create_subprocess_exec(
                     "sudo", "kill", str(pid),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 await proc.communicate()
-        VPN_PID_FILE.unlink(missing_ok=True)
+                for _ in range(10):
+                    if not await self._find_pid():
+                        break
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
         return VPNStatus(connected=False)
 
     async def status(self) -> VPNStatus:
-        pid = self._read_pid()
+        pid = await self._find_pid()
         if not pid:
             return VPNStatus(connected=False)
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            VPN_PID_FILE.unlink(missing_ok=True)
-            return VPNStatus(connected=False)
+        # Check if "Initialization Sequence Completed" in log
+        log = await self._read_log()
+        if not log or "Initialization Sequence Completed" not in log:
+            return VPNStatus(connected=False, pid=pid)
         local_ip = None
-        if VPN_LOG_FILE.exists():
-            log = VPN_LOG_FILE.read_text()
-            m = re.search(r"IFCONFIG\s+(?:tun\d+\s+)?(\d+\.\d+\.\d+\.\d+)", log)
-            if m:
-                local_ip = m.group(1)
+        m = re.search(r"/sbin/ifconfig\s+utun\d+\s+(\d+\.\d+\.\d+\.\d+)", log)
+        if m:
+            local_ip = m.group(1)
         return VPNStatus(connected=True, pid=pid, local_ip=local_ip, remote_ip="bastion.er.kcl.ac.uk")
+
+    async def _read_log(self) -> Optional[str]:
+        """Read VPN log file, using sudo if needed."""
+        if not VPN_LOG_FILE.exists():
+            return None
+        try:
+            return VPN_LOG_FILE.read_text()
+        except PermissionError:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "sudo", "cat", str(VPN_LOG_FILE),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                return stdout.decode(errors="replace")
+            except Exception:
+                return None
+
+    async def _find_pid(self) -> Optional[int]:
+        """Find openvpn PID via pgrep (works regardless of file permissions)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pgrep", "-f", "openvpn.*kcl-er-vpn",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0 and stdout.strip():
+                return int(stdout.strip().split()[0])
+        except Exception:
+            pass
+        return None
 
     def get_log_tail(self, lines: int = 50) -> str:
         if not VPN_LOG_FILE.exists():
             return "No VPN log file."
-        all_lines = VPN_LOG_FILE.read_text().splitlines()
+        try:
+            all_lines = VPN_LOG_FILE.read_text().splitlines()
+        except PermissionError:
+            try:
+                r = subprocess.run(
+                    ["sudo", "tail", f"-{lines}", str(VPN_LOG_FILE)],
+                    capture_output=True, timeout=5,
+                )
+                return r.stdout.decode(errors="replace")
+            except Exception:
+                return "Permission denied reading VPN log."
         return "\n".join(all_lines[-lines:])
 
     @staticmethod
@@ -145,12 +187,3 @@ class VPNManager:
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue
         return None
-
-    @staticmethod
-    def _read_pid() -> Optional[int]:
-        if not VPN_PID_FILE.exists():
-            return None
-        try:
-            return int(VPN_PID_FILE.read_text().strip())
-        except (ValueError, OSError):
-            return None
