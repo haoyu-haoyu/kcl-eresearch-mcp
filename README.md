@@ -106,7 +106,19 @@ The `KCL_TOTP_SECRET` is the base32 secret used to generate TOTP codes. To obtai
 
 Or use a TOTP app that displays the raw secret (e.g., Authy, KeePassXC).
 
-## Tools (16 total)
+## Tools (22 total) + Resources (5 total)
+
+### Read-only Resources
+
+These are intended for passive status reads and lightweight clients:
+
+| Resource | Description |
+|----------|-------------|
+| `er://current-ip` | Current public IP as JSON |
+| `er://session` | Portal session validity snapshot |
+| `er://mfa-status` | MFA entries + current IP approval status |
+| `er://diagnose` | Full connectivity diagnosis snapshot |
+| `er://health` | Server uptime, log file, and timeout/error counters |
 
 ### Auth
 
@@ -114,6 +126,7 @@ Or use a TOTP app that displays the raw secret (e.g., Authy, KeePassXC).
 |------|-------------|
 | `er_login` | Force SSO re-login (normally automatic) |
 | `er_session_check` | Test if the current portal session is valid |
+| `er_prepare_create` | One-call preparation: refresh session, approve current IP, then probe SSH |
 
 ### MFA (pure API, no browser, ~50ms)
 
@@ -138,9 +151,13 @@ Or use a TOTP app that displays the raw secret (e.g., Authy, KeePassXC).
 | Tool | Description |
 |------|-------------|
 | `er_ssh_test` | Test SSH connectivity + MFA diagnosis |
-| `er_ssh_run` | Execute a command on CREATE HPC |
+| `er_ssh_run` | Execute a short command on CREATE HPC |
 | `er_scp_transfer` | Upload/download files to/from CREATE |
 | `er_ssh_setup` | Configure SSH ControlMaster in `~/.ssh/config` |
+| `er_squeue` | Read Slurm queue state with a bounded, read-only query |
+| `er_sacct` | Read Slurm accounting state for one job |
+| `er_tail_file` | Tail a remote log or output file |
+| `er_ls` | List a remote directory with bounded output |
 
 ### Utility
 
@@ -148,6 +165,7 @@ Or use a TOTP app that displays the raw secret (e.g., Authy, KeePassXC).
 |------|-------------|
 | `er_current_ip` | Get current public IP address |
 | `er_diagnose` | Full diagnostic: IP → session → VPN → SSH → MFA with fix recommendations |
+| `er_health` | Inspect local server health, log files, and recent timeout/error counters |
 
 ## Environment Variables
 
@@ -178,6 +196,19 @@ Or use a TOTP app that displays the raw secret (e.g., Authy, KeePassXC).
 **After:**
 
 > Agent calls `er_vpn_connect` + `er_mfa_approve` → done. All subsequent SSH/SCP reuse one ControlMaster socket through stable VPN IP. Zero MFA churn.
+
+## Monitoring Guidance
+
+- Use `er_squeue`, `er_sacct`, `er_tail_file`, and `er_ls` for repeated monitoring.
+- Keep `er_ssh_run` for short RPC-style commands, not long polling loops such as `sleep 60 && ...`.
+- If you really need a slower SSH command, pass an explicit larger `timeout`.
+- Use `er_prepare_create` instead of chaining `er_session_check` → `er_mfa_status` → `er_mfa_approve` → `er_ssh_test`.
+
+## Observability
+
+- Server logs now live under `~/.kcl-er-mcp/logs/server.log`.
+- Structured call and SSH/SCP result events are appended to `~/.kcl-er-mcp/logs/events.jsonl`.
+- Use `er_health` or `er://health` to inspect uptime, recent timeout counters, and log file sizes.
 
 ## License
 
@@ -291,7 +322,17 @@ codex mcp add kcl-er \
 
 也可以使用能显示原始密钥的 TOTP 应用（如 Authy、KeePassXC）。
 
-## 工具列表（共 16 个）
+## 工具列表（共 22 个）+ 资源（共 5 个）
+
+### 只读资源
+
+| 资源 | 说明 |
+|------|------|
+| `er://current-ip` | 当前公网 IP 的 JSON 快照 |
+| `er://session` | Portal 会话有效性快照 |
+| `er://mfa-status` | MFA 条目和当前 IP 审批状态 |
+| `er://diagnose` | 全链路连接诊断快照 |
+| `er://health` | 服务 uptime、日志文件和 timeout/error 计数器 |
 
 ### 认证
 
@@ -299,6 +340,7 @@ codex mcp add kcl-er \
 |------|------|
 | `er_login` | 强制 SSO 重新登录（通常自动执行） |
 | `er_session_check` | 检测当前 Portal 会话是否有效 |
+| `er_prepare_create` | 一次性完成会话刷新、当前 IP 审批和 SSH 探测 |
 
 ### MFA（纯 API，无需浏览器，约 50ms）
 
@@ -323,9 +365,13 @@ codex mcp add kcl-er \
 | 工具 | 说明 |
 |------|------|
 | `er_ssh_test` | 测试 SSH 连通性 + MFA 诊断 |
-| `er_ssh_run` | 在 CREATE HPC 上执行命令 |
+| `er_ssh_run` | 在 CREATE HPC 上执行短命令 |
 | `er_scp_transfer` | 上传/下载文件至 CREATE |
 | `er_ssh_setup` | 在 `~/.ssh/config` 中配置 SSH ControlMaster |
+| `er_squeue` | 以有界只读方式查询 Slurm 队列 |
+| `er_sacct` | 查询单个作业的 Slurm accounting 状态 |
+| `er_tail_file` | 查看远端日志或输出文件尾部 |
+| `er_ls` | 以有界输出列出远端目录 |
 
 ### 实用工具
 
@@ -333,6 +379,7 @@ codex mcp add kcl-er \
 |------|------|
 | `er_current_ip` | 获取当前公网 IP |
 | `er_diagnose` | 全面诊断：IP → 会话 → VPN → SSH → MFA，并给出修复建议 |
+| `er_health` | 查看本地服务健康状态、日志文件和最近的 timeout/error 计数器 |
 
 ## 环境变量
 
@@ -363,6 +410,19 @@ codex mcp add kcl-er \
 **使用后：**
 
 > 智能体调用 `er_vpn_connect` + `er_mfa_approve` → 搞定。后续所有 SSH/SCP 复用同一个 ControlMaster socket，通过稳定的 VPN IP 连接。MFA 零干扰。
+
+## 监控建议
+
+- 高频监控优先用 `er_squeue`、`er_sacct`、`er_tail_file` 和 `er_ls`。
+- `er_ssh_run` 保留给短 RPC，不要再拿来做 `sleep 60 && ...` 这类长轮询。
+- 如果确实要跑更慢的 SSH 命令，显式传更大的 `timeout`。
+- 会话准备优先用 `er_prepare_create`，不要反复串 `er_session_check`、`er_mfa_status`、`er_mfa_approve`、`er_ssh_test`。
+
+## 可观测性
+
+- 服务日志写入 `~/.kcl-er-mcp/logs/server.log`。
+- 结构化调用事件与 SSH/SCP 结果写入 `~/.kcl-er-mcp/logs/events.jsonl`。
+- 用 `er_health` 或 `er://health` 查看 uptime、最近 timeout 次数和日志文件大小。
 
 ## 许可证
 

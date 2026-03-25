@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from kcl_er_mcp.observability import record_remote_exec
+
 logger = logging.getLogger(__name__)
 
 CREATE_HOST = "hpc.create.kcl.ac.uk"
@@ -28,6 +30,8 @@ class SSHResult:
     stderr: str = ""
     return_code: int = -1
     mfa_needed: bool = False
+    timed_out: bool = False
+    error_type: Optional[str] = None
     error: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -37,6 +41,8 @@ class SSHResult:
             "stderr": self.stderr[:500] if self.stderr else "",
             "return_code": self.return_code,
             "mfa_needed": self.mfa_needed,
+            "timed_out": self.timed_out,
+            "error_type": self.error_type,
             "error": self.error,
         }
 
@@ -55,13 +61,14 @@ class SSHHelper:
     def ensure_ssh_config(self) -> str:
         ssh_config = Path.home() / ".ssh" / "config"
         ssh_config.parent.mkdir(mode=0o700, exist_ok=True)
+        socket_path = self._control_socket()
         block = f"""
 # KCL CREATE HPC — managed by kcl-er-mcp
-Host create
+Host create {CREATE_HOST}
     HostName {CREATE_HOST}
     User {self.user}
     ControlMaster auto
-    ControlPath {SSH_SOCKETS_DIR}/%r@%h-%p
+    ControlPath {socket_path}
     ControlPersist 4h
     ServerAliveInterval 60
     ServerAliveCountMax 3
@@ -85,22 +92,54 @@ Host create
         return await self.run_command("echo CONNECTION_OK && hostname")
 
     async def check_control_master(self) -> dict:
-        socket = SSH_SOCKETS_DIR / f"{self.user}@{CREATE_HOST}-22"
+        socket = self._control_socket()
         if not socket.exists():
             return {"active": False, "socket": str(socket)}
         proc = await asyncio.create_subprocess_exec(
-            "ssh", "-O", "check", "create",
+            "ssh", "-S", str(socket), "-O", "check", f"{self.user}@{CREATE_HOST}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await proc.communicate()
         return {"active": proc.returncode == 0, "socket": str(socket), "message": stderr.decode().strip()}
 
-    async def run_command(self, command: str, timeout: int = 60) -> SSHResult:
-        args = [
-            "ssh", "-o", "ConnectTimeout=15", "-o", "BatchMode=yes",
-            "-o", f"ControlPath={SSH_SOCKETS_DIR}/%r@%h-%p",
-            f"{self.user}@{CREATE_HOST}", command,
+    def _control_socket(self) -> Path:
+        return SSH_SOCKETS_DIR / f"{self.user}@{CREATE_HOST}-22"
+
+    def _ssh_args(self) -> list[str]:
+        return [
+            "ssh",
+            "-o", "ConnectTimeout=15",
+            "-o", "BatchMode=yes",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=4h",
+            "-o", "ServerAliveInterval=60",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"ControlPath={self._control_socket()}",
         ]
+
+    async def _cleanup_subprocess(self, proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+        if proc.returncode is not None:
+            return await proc.communicate()
+
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return await proc.communicate()
+
+        try:
+            return await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for subprocess %s to terminate; killing it", proc.pid)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return await proc.communicate()
+
+    async def run_command(self, command: str, timeout: int = 60) -> SSHResult:
+        args = [*self._ssh_args(), f"{self.user}@{CREATE_HOST}", command]
+        proc: Optional[asyncio.subprocess.Process] = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -108,13 +147,84 @@ Host create
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             so, se = stdout.decode(errors="replace"), stderr.decode(errors="replace")
             if proc.returncode == 0:
+                record_remote_exec(
+                    "ssh",
+                    command=command,
+                    timeout=timeout,
+                    pid=proc.pid,
+                    return_code=0,
+                    timed_out=False,
+                    error_type=None,
+                    stderr=se,
+                )
                 return SSHResult(success=True, stdout=so, stderr=se, return_code=0)
             mfa = any(re.search(p, se, re.I) for p in MFA_ERROR_PATTERNS)
-            return SSHResult(success=False, stdout=so, stderr=se, return_code=proc.returncode or -1, mfa_needed=mfa, error=f"SSH failed: {se[:200]}")
+            error_type = "mfa" if mfa else "ssh"
+            record_remote_exec(
+                "ssh",
+                command=command,
+                timeout=timeout,
+                pid=proc.pid,
+                return_code=proc.returncode,
+                timed_out=False,
+                error_type=error_type,
+                stderr=se,
+            )
+            return SSHResult(
+                success=False,
+                stdout=so,
+                stderr=se,
+                return_code=proc.returncode or -1,
+                mfa_needed=mfa,
+                error_type=error_type,
+                error=f"SSH failed: {se[:200]}",
+            )
         except asyncio.TimeoutError:
-            return SSHResult(success=False, mfa_needed=True, error=f"Timeout after {timeout}s")
+            if proc is None:
+                record_remote_exec(
+                    "ssh",
+                    command=command,
+                    timeout=timeout,
+                    pid=None,
+                    return_code=None,
+                    timed_out=True,
+                    error_type="timeout",
+                )
+                return SSHResult(success=False, timed_out=True, error_type="timeout", error=f"Timeout after {timeout}s")
+            stdout, stderr = await self._cleanup_subprocess(proc)
+            so, se = stdout.decode(errors="replace"), stderr.decode(errors="replace")
+            logger.warning("SSH command timed out after %ss (pid=%s)", timeout, proc.pid)
+            record_remote_exec(
+                "ssh",
+                command=command,
+                timeout=timeout,
+                pid=proc.pid,
+                return_code=proc.returncode,
+                timed_out=True,
+                error_type="timeout",
+                stderr=se,
+            )
+            return SSHResult(
+                success=False,
+                stdout=so,
+                stderr=se,
+                return_code=proc.returncode or -1,
+                timed_out=True,
+                error_type="timeout",
+                error=f"Timeout after {timeout}s",
+            )
         except Exception as e:
-            return SSHResult(success=False, error=str(e))
+            record_remote_exec(
+                "ssh",
+                command=command,
+                timeout=timeout,
+                pid=getattr(proc, "pid", None),
+                return_code=getattr(proc, "returncode", None),
+                timed_out=False,
+                error_type="exception",
+                stderr=str(e),
+            )
+            return SSHResult(success=False, error_type="exception", error=str(e))
 
     async def scp_download(self, remote: str, local: str, timeout: int = 300) -> SSHResult:
         return await self._scp([f"{self.user}@{CREATE_HOST}:{remote}", local], timeout)
@@ -123,12 +233,83 @@ Host create
         return await self._scp([local, f"{self.user}@{CREATE_HOST}:{remote}"], timeout)
 
     async def _scp(self, paths: list[str], timeout: int) -> SSHResult:
-        args = ["scp", "-o", "ConnectTimeout=15", "-o", f"ControlPath={SSH_SOCKETS_DIR}/%r@%h-%p"] + paths
+        transfer_desc = " -> ".join(paths)
+        args = [
+            "scp",
+            "-o", "ConnectTimeout=15",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=4h",
+            "-o", "ServerAliveInterval=60",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"ControlPath={self._control_socket()}",
+        ] + paths
+        proc: Optional[asyncio.subprocess.Process] = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             so, se = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return SSHResult(success=proc.returncode == 0, stdout=so.decode(errors="replace"), stderr=se.decode(errors="replace"), return_code=proc.returncode or -1)
+            record_remote_exec(
+                "scp",
+                command=transfer_desc,
+                timeout=timeout,
+                pid=proc.pid,
+                return_code=proc.returncode,
+                timed_out=False,
+                error_type=None if proc.returncode == 0 else "scp",
+                stderr=se.decode(errors="replace"),
+            )
+            return SSHResult(
+                success=proc.returncode == 0,
+                stdout=so.decode(errors="replace"),
+                stderr=se.decode(errors="replace"),
+                return_code=proc.returncode or -1,
+                error_type=None if proc.returncode == 0 else "scp",
+                error=None if proc.returncode == 0 else f"SCP failed: {se.decode(errors='replace')[:200]}",
+            )
         except asyncio.TimeoutError:
-            return SSHResult(success=False, error=f"SCP timeout after {timeout}s")
+            if proc is None:
+                record_remote_exec(
+                    "scp",
+                    command=transfer_desc,
+                    timeout=timeout,
+                    pid=None,
+                    return_code=None,
+                    timed_out=True,
+                    error_type="timeout",
+                )
+                return SSHResult(success=False, timed_out=True, error_type="timeout", error=f"SCP timeout after {timeout}s")
+            so, se = await self._cleanup_subprocess(proc)
+            logger.warning("SCP transfer timed out after %ss (pid=%s)", timeout, proc.pid)
+            record_remote_exec(
+                "scp",
+                command=transfer_desc,
+                timeout=timeout,
+                pid=proc.pid,
+                return_code=proc.returncode,
+                timed_out=True,
+                error_type="timeout",
+                stderr=se.decode(errors="replace"),
+            )
+            return SSHResult(
+                success=False,
+                stdout=so.decode(errors="replace"),
+                stderr=se.decode(errors="replace"),
+                return_code=proc.returncode or -1,
+                timed_out=True,
+                error_type="timeout",
+                error=f"SCP timeout after {timeout}s",
+            )
+        except Exception as e:
+            record_remote_exec(
+                "scp",
+                command=transfer_desc,
+                timeout=timeout,
+                pid=getattr(proc, "pid", None),
+                return_code=getattr(proc, "returncode", None),
+                timed_out=False,
+                error_type="exception",
+                stderr=str(e),
+            )
+            return SSHResult(success=False, error_type="exception", error=str(e))
