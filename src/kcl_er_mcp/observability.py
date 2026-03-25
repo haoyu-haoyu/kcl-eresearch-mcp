@@ -20,6 +20,8 @@ EVENT_LOG_FILE = LOG_DIR / "events.jsonl"
 
 REDACTED_KEYS = ("password", "secret", "token", "cookie", "session", "csrf")
 MAX_STRING_LENGTH = 200
+MAX_EVENT_LOG_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_ROTATED_FILES = 3
 STARTED_AT = datetime.now(timezone.utc)
 
 _LOCK = threading.Lock()
@@ -104,11 +106,29 @@ def _sanitize(value: Any) -> Any:
     return _sanitize(str(value))
 
 
+def _maybe_rotate() -> None:
+    """Rotate events.jsonl when it exceeds MAX_EVENT_LOG_BYTES. Must be called under _LOCK."""
+    try:
+        if not EVENT_LOG_FILE.exists() or EVENT_LOG_FILE.stat().st_size < MAX_EVENT_LOG_BYTES:
+            return
+        # Shift existing rotated files: .3 → delete, .2 → .3, .1 → .2
+        for i in range(MAX_ROTATED_FILES, 0, -1):
+            src = EVENT_LOG_FILE.with_suffix(f".jsonl.{i}")
+            if i == MAX_ROTATED_FILES:
+                src.unlink(missing_ok=True)
+            elif src.exists():
+                src.rename(EVENT_LOG_FILE.with_suffix(f".jsonl.{i + 1}"))
+        EVENT_LOG_FILE.rename(EVENT_LOG_FILE.with_suffix(".jsonl.1"))
+    except OSError:
+        pass
+
+
 def _write_event(record: dict[str, Any]) -> None:
     setup_observability()
     if not _OBSERVABILITY_READY:
         return
     with _LOCK:
+        _maybe_rotate()
         try:
             with EVENT_LOG_FILE.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")

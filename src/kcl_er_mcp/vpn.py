@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -49,19 +50,60 @@ class VPNManager:
         if self._config_path:
             p = Path(self._config_path)
             if p.exists():
+                self._secure_config(p)
                 return p
         env = os.environ.get("KCL_ER_OVPN_CONFIG")
         if env:
             p = Path(env)
             if p.exists():
+                self._secure_config(p)
                 return p
         for ovpn in DEFAULT_OVPN_DIR.glob("*.ovpn"):
+            self._secure_config(ovpn)
             return ovpn
         dl = Path.home() / "Downloads"
         if dl.exists():
             for ovpn in sorted(dl.glob("*kcl*.ovpn"), reverse=True):
+                self._secure_config(ovpn)
                 return ovpn
         return None
+
+    @staticmethod
+    def _secure_config(path: Path) -> None:
+        """Ensure .ovpn file is chmod 600 (contains private keys)."""
+        try:
+            current = path.stat().st_mode & 0o777
+            if current != 0o600:
+                path.chmod(0o600)
+                logger.info("Fixed .ovpn permissions: %s (%o -> 600)", path, current)
+        except OSError:
+            pass
+
+    def check_cert_expiry(self, config_path: Optional[Path] = None) -> Optional[dict]:
+        """Parse embedded certificate in .ovpn and check expiry date."""
+        cfg = config_path or self.find_config()
+        if not cfg or not cfg.exists():
+            return None
+        try:
+            content = cfg.read_text()
+        except OSError:
+            return None
+        # Extract PEM block between <cert> and </cert>
+        m = re.search(r"<cert>\s*(-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----)", content, re.DOTALL)
+        if not m:
+            return None
+        try:
+            from cryptography import x509
+            cert = x509.load_pem_x509_certificate(m.group(1).encode())
+            expires = cert.not_valid_after_utc
+            days_remaining = (expires - datetime.now(timezone.utc)).days
+            return {
+                "expires_at": expires.isoformat(),
+                "days_remaining": days_remaining,
+                "warning": days_remaining <= 14,
+            }
+        except Exception:
+            return None
 
     async def connect(self, config_path: Optional[str] = None) -> VPNStatus:
         status = await self.status()
@@ -70,6 +112,7 @@ class VPNManager:
         cfg = Path(config_path) if config_path else self.find_config()
         if not cfg or not cfg.exists():
             return VPNStatus(connected=False, error="No .ovpn config found.")
+        self._secure_config(cfg)
         openvpn = self._find_openvpn()
         if not openvpn:
             return VPNStatus(connected=False, error="openvpn not found. Install: brew install openvpn")

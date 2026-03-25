@@ -57,7 +57,7 @@ async def lifespan(app):
     sm = SessionManager()
     portal = PortalClient(sm)
     vpn = VPNManager()
-    ssh = SSHHelper()
+    ssh = SSHHelper(portal=portal, session_manager=sm)
     try:
         yield {"sm": sm, "portal": portal, "vpn": vpn, "ssh": ssh}
     finally:
@@ -270,7 +270,13 @@ async def _get_diagnose_snapshot(ctx=None) -> dict:
         report["recommendations"].append("Session invalid. Will auto-login on next MFA operation.")
 
     vpn_status = await vpn.status()
-    report["checks"].append({"name": "VPN", "connected": vpn_status.connected, "tunnel_ip": vpn_status.local_ip})
+    vpn_check = {"name": "VPN", "connected": vpn_status.connected, "tunnel_ip": vpn_status.local_ip}
+    cert_info = vpn.check_cert_expiry()
+    if cert_info:
+        vpn_check["cert_expiry"] = cert_info
+        if cert_info.get("warning"):
+            report["recommendations"].append(f"VPN certificate expires in {cert_info['days_remaining']} days. Download a new .ovpn from the portal.")
+    report["checks"].append(vpn_check)
     if not vpn_status.connected:
         cfg = vpn.find_config()
         report["recommendations"].append(
@@ -453,6 +459,11 @@ async def er_vpn_status(params: EmptyInput, ctx=None) -> str:
     r["public_ip"] = await get_current_ip()
     cfg = vpn.find_config()
     r["config_found"] = str(cfg) if cfg else None
+    cert_info = vpn.check_cert_expiry(cfg)
+    if cert_info:
+        r["cert_expiry"] = cert_info
+        if cert_info.get("warning"):
+            r["warning"] = f"VPN certificate expires in {cert_info['days_remaining']} days!"
     return json.dumps(r, indent=2)
 
 
@@ -636,6 +647,7 @@ async def er_prepare_create(params: PrepareCreateInput, ctx=None) -> str:
                 }
             )
 
+    report["control_master"] = await ssh.get_control_master_info()
     report["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
     return _json(report)
 

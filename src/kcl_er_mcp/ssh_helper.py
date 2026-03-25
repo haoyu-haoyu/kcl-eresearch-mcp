@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -31,11 +32,12 @@ class SSHResult:
     return_code: int = -1
     mfa_needed: bool = False
     timed_out: bool = False
+    auto_recovered: bool = False
     error_type: Optional[str] = None
     error: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "success": self.success,
             "stdout": self.stdout[:2000] if self.stdout else "",
             "stderr": self.stderr[:500] if self.stderr else "",
@@ -45,12 +47,31 @@ class SSHResult:
             "error_type": self.error_type,
             "error": self.error,
         }
+        if self.auto_recovered:
+            d["auto_recovered"] = True
+        return d
 
 
 class SSHHelper:
-    def __init__(self, k_number: Optional[str] = None) -> None:
+    def __init__(self, k_number: Optional[str] = None, portal=None, session_manager=None) -> None:
         self._k_number = k_number or os.environ.get("KCL_K_NUMBER") or os.environ.get("KCL_EMAIL", "").split("@")[0]
+        self._portal = portal  # Optional PortalClient for auto-recovery
+        self._sm = session_manager
         SSH_SOCKETS_DIR.mkdir(parents=True, exist_ok=True)
+
+    async def _try_mfa_recovery(self) -> bool:
+        """Attempt to auto-approve current IP when SSH fails with MFA error. Returns True on success."""
+        if self._portal is None:
+            return False
+        try:
+            logger.info("SSH MFA failure detected, attempting auto-recovery...")
+            result = await self._portal.approve_current_ip("ssh")
+            ok = result.get("success", False)
+            logger.info("MFA auto-recovery %s", "succeeded" if ok else "failed")
+            return ok
+        except Exception as e:
+            logger.warning("MFA auto-recovery error: %s", e)
+            return False
 
     @property
     def user(self) -> str:
@@ -102,6 +123,26 @@ Host create {CREATE_HOST}
         _, stderr = await proc.communicate()
         return {"active": proc.returncode == 0, "socket": str(socket), "message": stderr.decode().strip()}
 
+    async def get_control_master_info(self) -> dict:
+        """Get ControlMaster socket info including remaining TTL."""
+        cm = await self.check_control_master()
+        socket = self._control_socket()
+        if not cm.get("active") or not socket.exists():
+            return cm
+        try:
+            mtime = socket.stat().st_mtime
+            created = datetime.fromtimestamp(mtime, tz=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+            ttl = max(0, 14400 - int(elapsed))  # ControlPersist 4h = 14400s
+            hours, remainder = divmod(ttl, 3600)
+            minutes = remainder // 60
+            cm["created_at"] = created.isoformat()
+            cm["ttl_remaining_seconds"] = ttl
+            cm["ttl_remaining_human"] = f"{hours}h {minutes}m"
+        except OSError:
+            pass
+        return cm
+
     def _control_socket(self) -> Path:
         return SSH_SOCKETS_DIR / f"{self.user}@{CREATE_HOST}-22"
 
@@ -137,6 +178,29 @@ Host create {CREATE_HOST}
                 pass
             return await proc.communicate()
 
+    async def _exec_ssh(self, command: str, timeout: int = 60) -> SSHResult:
+        """Low-level SSH exec — no auto-recovery, no observability recording."""
+        args = [*self._ssh_args(), f"{self.user}@{CREATE_HOST}", command]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            so, se = stdout.decode(errors="replace"), stderr.decode(errors="replace")
+            if proc.returncode == 0:
+                return SSHResult(success=True, stdout=so, stderr=se, return_code=0)
+            mfa = any(re.search(p, se, re.I) for p in MFA_ERROR_PATTERNS)
+            return SSHResult(
+                success=False, stdout=so, stderr=se,
+                return_code=proc.returncode or -1,
+                mfa_needed=mfa, error_type="mfa" if mfa else "ssh",
+                error=f"SSH failed: {se[:200]}",
+            )
+        except asyncio.TimeoutError:
+            return SSHResult(success=False, timed_out=True, error_type="timeout", error=f"Timeout after {timeout}s")
+        except Exception as e:
+            return SSHResult(success=False, error_type="exception", error=str(e))
+
     async def run_command(self, command: str, timeout: int = 60) -> SSHResult:
         args = [*self._ssh_args(), f"{self.user}@{CREATE_HOST}", command]
         proc: Optional[asyncio.subprocess.Process] = None
@@ -170,6 +234,22 @@ Host create {CREATE_HOST}
                 error_type=error_type,
                 stderr=se,
             )
+            # Auto-recovery: approve current IP and retry once
+            if mfa and await self._try_mfa_recovery():
+                await asyncio.sleep(2)  # Wait for MFA propagation
+                retry = await self._exec_ssh(command, timeout)
+                retry.auto_recovered = retry.success
+                record_remote_exec(
+                    "ssh",
+                    command=command,
+                    timeout=timeout,
+                    pid=None,
+                    return_code=retry.return_code,
+                    timed_out=retry.timed_out,
+                    error_type=None if retry.success else "ssh_retry",
+                    stderr=retry.stderr[:200],
+                )
+                return retry
             return SSHResult(
                 success=False,
                 stdout=so,
